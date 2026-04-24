@@ -30,8 +30,8 @@ from pmac_sdk.controller.robot_api import PMACRobotController
 
 PMAC_IP = "192.168.0.200"
 
-R_HOLE = 0.003
-D_SPOOL = 0.012
+R_HOLE =  0.00215 # 2.15 mm 
+D_SPOOL = 0.012   # 12 mm
 
 THETA_A_MAX_DEG = 180.0
 THETA_C_MAX_DEG = 90.0
@@ -58,7 +58,8 @@ class InteractivePMACJointTestApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("TDRC PMAC Interactive Flow Test")
-        self.root.geometry("1500x900")
+        self.root.geometry("1500x1050")
+        self.root.minsize(1500, 950)
 
         self.log_queue: queue.Queue[str] = queue.Queue()
 
@@ -75,6 +76,8 @@ class InteractivePMACJointTestApp:
 
         self.connected = False
         self.zero_ready = False
+        self.control_mode = "calibration"
+        self.control_mode = "calibration"  # "calibration" or "joint_control"
 
         self.calibration_base_pulses = [0, 0, 0, 0, 0]
         self.zero_pulses = [0, 0, 0, 0, 0]
@@ -179,6 +182,12 @@ class InteractivePMACJointTestApp:
             command=self.set_current_as_zero,
         ).pack(fill="x", pady=4)
 
+        ttk.Button(
+            box,
+            text="Return To Calibration Mode",
+            command=self.return_to_calibration_mode,
+        ).pack(fill="x", pady=4)
+
     def _build_joint_panel(self, parent):
         box = ttk.LabelFrame(parent, text="3. Joint Space Control", padding=10)
         box.pack(fill="x", padx=5, pady=5)
@@ -211,6 +220,12 @@ class InteractivePMACJointTestApp:
             box,
             text="Reset Joint Sliders",
             command=self.reset_joint_sliders,
+        ).pack(fill="x", pady=4)
+
+        ttk.Button(
+            box,
+            text="Enter Joint Control Mode",
+            command=self.enter_joint_control_mode,
         ).pack(fill="x", pady=4)
 
     def _add_slider(self, parent, label, var, frm, to, resolution, unit, callback):
@@ -333,15 +348,15 @@ class InteractivePMACJointTestApp:
     # =========================
 
     def _on_calib_slider_changed(self):
-        if self.calib_live.get() and self.connected and not self.zero_ready:
+        if self.calib_live.get() and self.connected and self.control_mode == "calibration": 
             self.send_calibration_delta()
 
     def send_calibration_delta(self):
         if not self._check_connected():
             return
 
-        if self.zero_ready:
-            self._log("Calibration is already finished. Ignore calibration delta command.")
+        if self.control_mode != "calibration":
+            self._log("Not in calibration mode. Ignore calibration delta command.")
             return
 
         deltas_deg = [v.get() for v in self.calib_delta_deg]
@@ -381,6 +396,7 @@ class InteractivePMACJointTestApp:
             self.robot.base_positions = list(current)
 
             self.zero_ready = True
+            self.control_mode = "joint"
 
             for var in self.calib_delta_deg:
                 var.set(0.0)
@@ -391,6 +407,52 @@ class InteractivePMACJointTestApp:
 
         except Exception as e:
             self._log(f"ERROR: set current as zero failed: {e}")
+    
+    def return_to_calibration_mode(self):
+        if not self._check_connected():
+            return
+
+        self.joint_live.set(False)
+        self.calib_live.set(False)
+
+        try:
+            current = self.robot.modbus.read_int32_array(address=10, count=5)
+            self.calibration_base_pulses = list(current)
+
+            for var in self.calib_delta_deg:
+                var.set(0.0)
+
+            self.control_mode = "calibration"
+            self.zero_ready = False
+
+            self._log("Returned to calibration mode.")
+            self._log(f"New calibration base pulses: {self.calibration_base_pulses}")
+            self._log("Use motor delta sliders to re-straighten the continuum, then click Set Current As Zero.")
+
+        except Exception as e:
+            self._log(f"ERROR: return to calibration mode failed: {e}")
+
+
+    def enter_joint_mode(self):
+        if not self._check_connected():
+            return
+
+        if not self.zero_ready:
+            messagebox.showwarning(
+                "Zero not ready",
+                "Please click Set Current As Zero before entering joint control mode.",
+            )
+            return
+
+        self.calib_live.set(False)
+        self.control_mode = "joint"
+
+        self._log("Entered joint control mode.")
+
+    # Backward-compatible name used by button bindings.
+    def enter_joint_control_mode(self):
+        self.enter_joint_mode()
+
 
     # =========================
     # Joint control
@@ -398,8 +460,14 @@ class InteractivePMACJointTestApp:
 
     def _on_joint_slider_changed(self):
         self.update_joint_preview()
-        if self.joint_live.get() and self.connected and self.zero_ready:
+        if (
+        self.joint_live.get()
+        and self.connected
+        and self.zero_ready
+        and self.control_mode == "joint"
+        ):
             self.send_joint_target()
+
 
     def get_joint(self) -> JointSpace:
         return JointSpace(
@@ -438,6 +506,11 @@ class InteractivePMACJointTestApp:
             messagebox.showwarning(
                 "Zero not ready",
                 "Please finish manual calibration and click Set Current As Zero first.",
+            )
+        if self.control_mode != "joint":
+            messagebox.showwarning(
+                "Not in joint mode",
+                "Please click Enter Joint Control Mode first.",
             )
             return
 
