@@ -13,12 +13,23 @@ from subscriber import start_subscriber
 from publisher import start_publisher
 from robot_msgs import MotorTarget, RobotState
 
+from robot_msgs import topics
+from robot_msgs.serialization import dumps_topic_msg
+
+context = zmq.Context()
+motor_pub = context.socket(zmq.PUB)
+motor_pub.bind("tcp://127.0.0.1:5557")
+time.sleep(0.2)
+
 def main():
     stop_event = threading.Event()
 
     # 简单回调测试
     def send_motor_callback(mt: MotorTarget):
-        print(f"[SendMotor] {mt.motor_angles_rad}")
+        topic, payload = dumps_topic_msg(topics.TOPIC_MOTOR_TARGET, mt)
+        motor_pub.send_multipart([topic, payload])
+        print(f"[Coordinator --> PMACBridge] {mt.motor_angles_rad}")
+        #print(f"[SendMotor] {mt.motor_angles_rad}")
 
     def publish_state_callback(state):
         print(f"[State] Mode={state.mode}, Angles={state.motor_angles_rad}")
