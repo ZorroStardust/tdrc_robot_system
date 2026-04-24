@@ -1,5 +1,9 @@
-from pymodbus.client.sync import ModbusTcpClient
 from typing import List
+
+try:
+    from pymodbus.client import ModbusTcpClient
+except ImportError:  # pragma: no cover - compatibility with older pymodbus
+    from pymodbus.client.sync import ModbusTcpClient
 
 class ModbusClient32Bit:
     """封装底层的 32-bit Modbus 读写操作，与具体业务无关"""

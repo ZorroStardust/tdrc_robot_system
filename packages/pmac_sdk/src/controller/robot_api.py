@@ -1,6 +1,6 @@
-from ..core.config_model import PMACConfig
-from ..comms.modbus_client import ModbusClient32Bit
-from ..hardware.ssh_manager import PMACHardwareManager
+from core.config_model import PMACConfig
+from comms.modbus_client import ModbusClient32Bit
+from hardware.ssh_manager import PMACHardwareManager
 
 class PMACRobotController:
     """具身智能上层控制接口 (严格遵循原机通信逻辑)"""
