@@ -14,18 +14,27 @@ class PMACRobotController:
         """执行硬件级别的上电和复位"""
         self.hw_manager.init_motors()
 
+    # def connect_and_home(self):
+        # """连接 Modbus 并获取当前真实位置作为基准"""
+        # if not self.modbus.connect():
+            # raise ConnectionError("❌ 无法连接到 PMAC，请检查网络设置。")
+        
+        # 按照原代码逻辑，直接去读地址 10 的 10个寄存器
+        # res = self.modbus.client.read_holding_registers(address=10, count=10, slave=self.config.slave_id)
+        # if not res.isError():
+            # regs = res.registers
+            # for i in range(5):
+                # self.base_positions[i] = self.modbus._registers_to_int32(regs[i*2], regs[i*2+1])
+        # print(f"✅ 系统就绪，基准位置: {self.base_positions}")
+
     def connect_and_home(self):
         """连接 Modbus 并获取当前真实位置作为基准"""
         if not self.modbus.connect():
             raise ConnectionError("❌ 无法连接到 PMAC，请检查网络设置。")
-        
-        # 按照原代码逻辑，直接去读地址 10 的 10个寄存器
-        res = self.modbus.client.read_holding_registers(address=10, count=10, unit=self.config.slave_id)
-        if not res.isError():
-            regs = res.registers
-            for i in range(5):
-                self.base_positions[i] = self.modbus._registers_to_int32(regs[i*2], regs[i*2+1])
+
+        self.base_positions = self.modbus.read_int32_array(address=10, count=5)
         print(f"✅ 系统就绪，基准位置: {self.base_positions}")
+
 
     def move_joints(self, target_pulses: list, move_time: int = 500, accel: int = 100, scurve: int = 50):
         """核心底层：只下发原版的地址 0 和 地址 100，并新增动态时间参数"""
