@@ -1,0 +1,20 @@
+[workspace]
+authors = ["zorrostardust@163.com <zorrostardust@163.com>"]
+channels = [
+    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/",
+    "conda-forge"]
+name = "tdrc_robot_system"
+platforms = ["win-64", "linux-64"]
+version = "0.1.0"
+
+[pypi-options]
+index-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+extra-index-urls = ["https://mirrors.aliyun.com/pypi/simple/"]
+
+[tasks]
+
+[dependencies]
+python = ">=3.10,<3.13"
+numpy = "*"
+paramiko=">=4.0.0"
+pymodbus = ">=2.5.3"
