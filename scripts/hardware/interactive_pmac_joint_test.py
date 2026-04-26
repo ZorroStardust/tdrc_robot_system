@@ -30,7 +30,7 @@ from pmac_sdk.controller.robot_api import PMACRobotController
 
 PMAC_IP = "192.168.0.200"
 
-R_HOLE =  0.00215 # 2.15 mm 
+R_HOLE = 0.00215  # 2.15 mm
 D_SPOOL = 0.012   # 12 mm
 
 THETA_A_MAX_DEG = 180.0
@@ -42,9 +42,12 @@ CALIB_MOVE_TIME_MS = 100
 ACCEL = 50
 SCURVE = 0
 
+# ideal motor index -> real PMAC axis index
 MOTOR_INDEX_MAP = {1: 2, 2: 1, 3: 3, 4: 4}
 # MOTOR_INDEX_MAP = {1: 1, 2: 2, 3: 3, 4: 4}
-MOTOR_DIRECTION_MAP = {1: -1, 2: -1, 3: -1, 4: -1}
+
+# real PMAC axis index -> direction sign
+MOTOR_DIRECTION_MAP = {1: -1, 2: 1, 3: -1, 4: -1}
 # MOTOR_DIRECTION_MAP = {1: 1, 2: 1, 3: 1, 4: 1}
 
 
@@ -60,8 +63,8 @@ class InteractivePMACJointTestApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("TDRC PMAC Interactive Flow Test")
-        self.root.geometry("1500x1050")
-        self.root.minsize(1500, 950)
+        self.root.geometry("1500x950")
+        self.root.minsize(1200, 800)
 
         self.log_queue: queue.Queue[str] = queue.Queue()
 
@@ -78,8 +81,7 @@ class InteractivePMACJointTestApp:
 
         self.connected = False
         self.zero_ready = False
-        self.control_mode = "calibration"
-        self.control_mode = "calibration"  # "calibration" or "joint_control"
+        self.control_mode = "calibration"  # "calibration" or "joint"
 
         self.calibration_base_pulses = [0, 0, 0, 0, 0]
         self.zero_pulses = [0, 0, 0, 0, 0]
@@ -99,8 +101,7 @@ class InteractivePMACJointTestApp:
         main = ttk.Frame(self.root)
         main.pack(fill="both", expand=True)
 
-        left = ttk.Frame(main, padding=10)
-        left.pack(side="left", fill="y")
+        left = self._build_scrollable_left_panel(main)
 
         right = ttk.Frame(main, padding=10)
         right.pack(side="left", fill="both", expand=True)
@@ -110,6 +111,39 @@ class InteractivePMACJointTestApp:
         self._build_joint_panel(left)
         self._build_status_panel(right)
         self._build_plots(right)
+
+    def _build_scrollable_left_panel(self, parent):
+        left_container = ttk.Frame(parent)
+        left_container.pack(side="left", fill="y")
+
+        left_canvas = tk.Canvas(left_container, width=560, highlightthickness=0)
+        left_scrollbar = ttk.Scrollbar(
+            left_container,
+            orient="vertical",
+            command=left_canvas.yview,
+        )
+        left_canvas.configure(yscrollcommand=left_scrollbar.set)
+
+        left_scrollbar.pack(side="right", fill="y")
+        left_canvas.pack(side="left", fill="both", expand=True)
+
+        left = ttk.Frame(left_canvas, padding=10)
+        left_window = left_canvas.create_window((0, 0), window=left, anchor="nw")
+
+        def _on_left_configure(_event):
+            left_canvas.configure(scrollregion=left_canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            left_canvas.itemconfigure(left_window, width=event.width)
+
+        def _on_mousewheel(event):
+            left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        left.bind("<Configure>", _on_left_configure)
+        left_canvas.bind("<Configure>", _on_canvas_configure)
+        left_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        return left
 
     def _build_connection_panel(self, parent):
         box = ttk.LabelFrame(parent, text="1. PMAC Connection", padding=10)
@@ -148,11 +182,42 @@ class InteractivePMACJointTestApp:
         ).pack(fill="x", pady=4)
 
     def _build_calibration_panel(self, parent):
-        box = ttk.LabelFrame(parent, text="2. Manual Motor Calibration", padding=10)
+        box = ttk.LabelFrame(
+            parent,
+            text="2. Manual Motor Calibration",
+            padding=10,
+        )
         box.pack(fill="x", padx=5, pady=5)
 
         self.calib_live = tk.BooleanVar(value=False)
+        self.calib_axis_mode = tk.StringVar(value="real")  # "real" or "ideal"
         self.calib_delta_deg = [tk.DoubleVar(value=0.0) for _ in range(4)]
+
+        mode_box = ttk.LabelFrame(box, text="Calibration Axis Mode", padding=6)
+        mode_box.pack(fill="x", pady=(0, 8))
+
+        ttk.Radiobutton(
+            mode_box,
+            text="Real PMAC Axis",
+            variable=self.calib_axis_mode,
+            value="real",
+            command=self._on_calib_axis_mode_changed,
+        ).pack(anchor="w")
+
+        ttk.Radiobutton(
+            mode_box,
+            text="Ideal Model Motor",
+            variable=self.calib_axis_mode,
+            value="ideal",
+            command=self._on_calib_axis_mode_changed,
+        ).pack(anchor="w")
+
+        self.mapping_label = ttk.Label(
+            mode_box,
+            text=self._mapping_text(),
+            justify="left",
+        )
+        self.mapping_label.pack(anchor="w", pady=(6, 0))
 
         ttk.Checkbutton(
             box,
@@ -160,17 +225,21 @@ class InteractivePMACJointTestApp:
             variable=self.calib_live,
         ).pack(anchor="w", pady=(0, 8))
 
+        self.calib_slider_labels: list[ttk.Label] = []
         for i, var in enumerate(self.calib_delta_deg):
             self._add_slider(
                 box,
-                label=f"motor {i+1} delta",
+                label=self._calib_slider_label(i),
                 var=var,
                 frm=-CALIB_DELTA_LIMIT_DEG,
                 to=CALIB_DELTA_LIMIT_DEG,
                 resolution=0.1,
                 unit="deg",
                 callback=self._on_calib_slider_changed,
+                label_store=self.calib_slider_labels,
             )
+
+        self._build_single_axis_direct_test_panel(box)
 
         ttk.Button(
             box,
@@ -189,6 +258,44 @@ class InteractivePMACJointTestApp:
             text="Return To Calibration Mode",
             command=self.return_to_calibration_mode,
         ).pack(fill="x", pady=4)
+
+    def _build_single_axis_direct_test_panel(self, parent):
+        box = ttk.LabelFrame(parent, text="Single Axis Direct Test", padding=6)
+        box.pack(fill="x", pady=(8, 8))
+
+        self.direct_axis = tk.IntVar(value=1)
+        self.direct_delta_deg = tk.DoubleVar(value=0.0)
+        self.direct_abs_pulse = tk.IntVar(value=0)
+
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=3)
+
+        ttk.Label(row, text="real axis", width=10).pack(side="left")
+        ttk.Entry(row, textvariable=self.direct_axis, width=6).pack(side="left")
+
+        ttk.Label(row, text="delta deg", width=10).pack(side="left", padx=(8, 0))
+        ttk.Entry(row, textvariable=self.direct_delta_deg, width=10).pack(side="left")
+
+        ttk.Button(
+            row,
+            text="Move Delta",
+            command=self.move_real_axis_delta_input,
+        ).pack(side="left", padx=(8, 0))
+
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=3)
+
+        ttk.Label(row, text="real axis", width=10).pack(side="left")
+        ttk.Entry(row, textvariable=self.direct_axis, width=6).pack(side="left")
+
+        ttk.Label(row, text="abs pulse", width=10).pack(side="left", padx=(8, 0))
+        ttk.Entry(row, textvariable=self.direct_abs_pulse, width=14).pack(side="left")
+
+        ttk.Button(
+            row,
+            text="Move Abs Pulse",
+            command=self.move_real_axis_abs_pulse_input,
+        ).pack(side="left", padx=(8, 0))
 
     def _build_joint_panel(self, parent):
         box = ttk.LabelFrame(parent, text="3. Joint Space Control", padding=10)
@@ -230,11 +337,26 @@ class InteractivePMACJointTestApp:
             command=self.enter_joint_control_mode,
         ).pack(fill="x", pady=4)
 
-    def _add_slider(self, parent, label, var, frm, to, resolution, unit, callback):
+    def _add_slider(
+        self,
+        parent,
+        label,
+        var,
+        frm,
+        to,
+        resolution,
+        unit,
+        callback,
+        label_store: list[ttk.Label] | None = None,
+    ):
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=4)
 
-        ttk.Label(row, text=label, width=14).pack(side="left")
+        name_label = ttk.Label(row, text=label, width=24)
+        name_label.pack(side="left")
+
+        if label_store is not None:
+            label_store.append(name_label)
 
         scale = tk.Scale(
             row,
@@ -286,6 +408,38 @@ class InteractivePMACJointTestApp:
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
     # =========================
+    # UI helpers
+    # =========================
+
+    def _calib_slider_label(self, idx: int) -> str:
+        if self.calib_axis_mode.get() == "real":
+            return f"real axis {idx + 1} delta"
+
+        ideal_motor = idx + 1
+        real_motor = MOTOR_INDEX_MAP[ideal_motor]
+        sign = MOTOR_DIRECTION_MAP[real_motor]
+        return f"ideal motor {ideal_motor} -> real {real_motor} ({sign:+d})"
+
+    def _mapping_text(self) -> str:
+        lines = ["Current ideal-to-real mapping:"]
+        for ideal_motor in range(1, 5):
+            real_motor = MOTOR_INDEX_MAP[ideal_motor]
+            sign = MOTOR_DIRECTION_MAP[real_motor]
+            lines.append(f"  ideal {ideal_motor} -> real {real_motor}, direction sign = {sign:+d}")
+        return "\n".join(lines)
+
+    def _on_calib_axis_mode_changed(self):
+        if hasattr(self, "mapping_label"):
+            self.mapping_label.config(text=self._mapping_text())
+
+        if hasattr(self, "calib_slider_labels"):
+            for i, label in enumerate(self.calib_slider_labels):
+                label.config(text=self._calib_slider_label(i))
+
+        mode = self.calib_axis_mode.get()
+        self._log(f"Calibration axis mode changed to: {mode}")
+
+    # =========================
     # PMAC
     # =========================
 
@@ -308,13 +462,16 @@ class InteractivePMACJointTestApp:
             self.robot.connect_and_home()
 
             self.connected = True
+            self.control_mode = "calibration"
+            self.zero_ready = False
+
             self.calibration_base_pulses = list(self.robot.base_positions)
             self.zero_pulses = list(self.robot.base_positions)
             self.last_target_pulses = list(self.robot.base_positions)
 
-            self._log(f"PMAC connected.")
+            self._log("PMAC connected.")
             self._log(f"Calibration base pulses: {self.calibration_base_pulses}")
-            self._log("Now use motor delta sliders to manually straighten the continuum.")
+            self._log("Now use calibration sliders to test real axis or ideal motor mapping.")
 
         except Exception as e:
             self.connected = False
@@ -326,6 +483,7 @@ class InteractivePMACJointTestApp:
                 self.robot.close()
             self.connected = False
             self.zero_ready = False
+            self.control_mode = "calibration"
             self._log("PMAC connection closed.")
         except Exception as e:
             self._log(f"ERROR: close failed: {e}")
@@ -333,6 +491,7 @@ class InteractivePMACJointTestApp:
     def read_current_pulses(self):
         if not self._check_connected():
             return
+
         try:
             current = self.robot.modbus.read_int32_array(address=10, count=5)
             self._log(f"Current pulses: {current}")
@@ -350,7 +509,7 @@ class InteractivePMACJointTestApp:
     # =========================
 
     def _on_calib_slider_changed(self):
-        if self.calib_live.get() and self.connected and self.control_mode == "calibration": 
+        if self.calib_live.get() and self.connected and self.control_mode == "calibration":
             self.send_calibration_delta()
 
     def send_calibration_delta(self):
@@ -364,10 +523,24 @@ class InteractivePMACJointTestApp:
         deltas_deg = [v.get() for v in self.calib_delta_deg]
         target = list(self.calibration_base_pulses)
 
-        for i in range(4):
-            target[i] = int(
-                self.calibration_base_pulses[i]
-                + deltas_deg[i] * self.config.pulses_per_degree
+        mode = self.calib_axis_mode.get()
+
+        for idx in range(4):
+            delta_deg = deltas_deg[idx]
+
+            if mode == "real":
+                real_axis = idx + 1
+                real_i = real_axis - 1
+                sign = 1.0
+            else:
+                ideal_motor = idx + 1
+                real_axis = MOTOR_INDEX_MAP[ideal_motor]
+                real_i = real_axis - 1
+                sign = float(MOTOR_DIRECTION_MAP[real_axis])
+
+            target[real_i] = int(
+                self.calibration_base_pulses[real_i]
+                + sign * delta_deg * self.config.pulses_per_degree
             )
 
         self._send_pmac_target(
@@ -375,15 +548,102 @@ class InteractivePMACJointTestApp:
             move_time=CALIB_MOVE_TIME_MS,
             accel=ACCEL,
             scurve=SCURVE,
-            tag="calibration_delta",
+            tag=f"calibration_delta_{mode}",
         )
 
         self._update_calc_panel(
             motor_rad=[math.radians(x) for x in deltas_deg],
             target_pulses=target,
-            extra="Calibration delta mode\n"
-                  "These deltas are relative to calibration_base_pulses.\n"
-                  "After the continuum is roughly straight, click Set Current As Zero."
+            extra=(
+                f"Calibration delta mode: {mode}\n"
+                "Real mode: slider i directly controls real PMAC axis i.\n"
+                "Ideal mode: slider i means ideal model motor i and is mapped to real axis.\n"
+                "After the continuum is roughly straight, click Set Current As Zero.\n"
+            ),
+        )
+
+    def _get_direct_axis_index(self) -> int | None:
+        axis = self.direct_axis.get()
+
+        if axis < 1 or axis > 5:
+            messagebox.showwarning(
+                "Invalid axis",
+                "Axis must be 1~5.",
+            )
+            return None
+
+        return axis - 1
+
+    def move_real_axis_delta_input(self):
+        if not self._check_connected():
+            return
+
+        if self.control_mode != "calibration":
+            messagebox.showwarning(
+                "Not in calibration mode",
+                "Please return to calibration mode first.",
+            )
+            return
+
+        axis_i = self._get_direct_axis_index()
+        if axis_i is None:
+            return
+
+        delta_deg = self.direct_delta_deg.get()
+
+        target = list(self.calibration_base_pulses)
+        target[axis_i] = int(
+            self.calibration_base_pulses[axis_i]
+            + delta_deg * self.config.pulses_per_degree
+        )
+
+        self._send_pmac_target(
+            target,
+            move_time=CALIB_MOVE_TIME_MS,
+            accel=ACCEL,
+            scurve=SCURVE,
+            tag=f"real_axis_{axis_i + 1}_delta_input",
+        )
+
+        self._update_calc_panel(
+            motor_rad=[0.0, 0.0, 0.0, 0.0],
+            target_pulses=target,
+            extra=(
+                "Single real axis delta input.\n"
+                f"real axis = {axis_i + 1}\n"
+                f"delta_deg = {delta_deg:.3f}\n"
+                "Delta is relative to calibration_base_pulses.\n"
+            ),
+        )
+
+    def move_real_axis_abs_pulse_input(self):
+        if not self._check_connected():
+            return
+
+        axis_i = self._get_direct_axis_index()
+        if axis_i is None:
+            return
+
+        target = list(self.last_target_pulses)
+        target[axis_i] = int(self.direct_abs_pulse.get())
+
+        self._send_pmac_target(
+            target,
+            move_time=CALIB_MOVE_TIME_MS,
+            accel=ACCEL,
+            scurve=SCURVE,
+            tag=f"real_axis_{axis_i + 1}_abs_pulse_input",
+        )
+
+        self._update_calc_panel(
+            motor_rad=[0.0, 0.0, 0.0, 0.0],
+            target_pulses=target,
+            extra=(
+                "Single real axis absolute pulse input.\n"
+                f"real axis = {axis_i + 1}\n"
+                f"abs_pulse = {self.direct_abs_pulse.get()}\n"
+                "Target is based on last_target_pulses with only this axis replaced.\n"
+            ),
         )
 
     def set_current_as_zero(self):
@@ -409,7 +669,7 @@ class InteractivePMACJointTestApp:
 
         except Exception as e:
             self._log(f"ERROR: set current as zero failed: {e}")
-    
+
     def return_to_calibration_mode(self):
         if not self._check_connected():
             return
@@ -429,11 +689,10 @@ class InteractivePMACJointTestApp:
 
             self._log("Returned to calibration mode.")
             self._log(f"New calibration base pulses: {self.calibration_base_pulses}")
-            self._log("Use motor delta sliders to re-straighten the continuum, then click Set Current As Zero.")
+            self._log("Use calibration sliders to re-straighten or test mapping, then click Set Current As Zero.")
 
         except Exception as e:
             self._log(f"ERROR: return to calibration mode failed: {e}")
-
 
     def enter_joint_mode(self):
         if not self._check_connected():
@@ -451,10 +710,8 @@ class InteractivePMACJointTestApp:
 
         self._log("Entered joint control mode.")
 
-    # Backward-compatible name used by button bindings.
     def enter_joint_control_mode(self):
         self.enter_joint_mode()
-
 
     # =========================
     # Joint control
@@ -462,14 +719,14 @@ class InteractivePMACJointTestApp:
 
     def _on_joint_slider_changed(self):
         self.update_joint_preview()
+
         if (
-        self.joint_live.get()
-        and self.connected
-        and self.zero_ready
-        and self.control_mode == "joint"
+            self.joint_live.get()
+            and self.connected
+            and self.zero_ready
+            and self.control_mode == "joint"
         ):
             self.send_joint_target()
-
 
     def get_joint(self) -> JointSpace:
         return JointSpace(
@@ -496,8 +753,11 @@ class InteractivePMACJointTestApp:
         self._update_calc_panel(
             motor_rad=motor_rad,
             target_pulses=target_pulses,
-            extra="Joint-space preview only.\n"
-                  "Target pulses are computed from zero_pulses + motor_angle_deg * pulses_per_degree."
+            extra=(
+                "Joint-space preview only.\n"
+                "Target pulses are computed from zero_pulses + motor_angle_deg * pulses_per_degree.\n"
+                "Joint-space motor angles already use model motor mapping internally.\n"
+            ),
         )
 
     def send_joint_target(self):
@@ -509,6 +769,8 @@ class InteractivePMACJointTestApp:
                 "Zero not ready",
                 "Please finish manual calibration and click Set Current As Zero first.",
             )
+            return
+
         if self.control_mode != "joint":
             messagebox.showwarning(
                 "Not in joint mode",
@@ -533,7 +795,7 @@ class InteractivePMACJointTestApp:
         self._update_calc_panel(
             motor_rad=motor_rad,
             target_pulses=target_pulses,
-            extra="Joint target sent to PMAC."
+            extra="Joint target sent to PMAC.",
         )
 
     def motor_rad_to_absolute_pulses(self, motor_rad: list[float]) -> list[int]:
@@ -571,20 +833,24 @@ class InteractivePMACJointTestApp:
     # =========================
 
     def _update_calc_panel(self, motor_rad, target_pulses, extra=""):
-        joint = self.get_joint()
-
         text = (
+            "[System]\n"
+            f"control_mode = {self.control_mode}\n"
+            f"calib_axis_mode = {getattr(self, 'calib_axis_mode', tk.StringVar(value='N/A')).get()}\n\n"
             "[Joint]\n"
             f"phi_a   = {self.phi_a_deg.get():.3f} deg\n"
             f"theta_a = {self.theta_a_deg.get():.3f} deg\n"
             f"phi_c   = {self.phi_c_deg.get():.3f} deg\n"
             f"theta_c = {self.theta_c_deg.get():.3f} deg\n\n"
-            "[Motor angles]\n"
+            "[Motor angles shown]\n"
             f"rad = {fmt_list(motor_rad, 6)}\n"
             f"deg = {fmt_list([rad_to_deg(x) for x in motor_rad], 3)}\n\n"
             "[Pulses]\n"
-            f"zero_pulses   = {self.zero_pulses}\n"
-            f"target_pulses = {target_pulses}\n\n"
+            f"calibration_base_pulses = {self.calibration_base_pulses}\n"
+            f"zero_pulses             = {self.zero_pulses}\n"
+            f"target_pulses           = {target_pulses}\n\n"
+            "[Mapping]\n"
+            f"{self._mapping_text()}\n\n"
             f"{extra}\n"
         )
 
@@ -602,7 +868,7 @@ class InteractivePMACJointTestApp:
         pulse_delta = np.array(self.last_target_pulses, dtype=float) - np.array(self.zero_pulses, dtype=float)
 
         self.ax_motor_rad.bar([f"m{i}" for i in range(1, 5)], motor_rad)
-        self.ax_motor_rad.set_title("Motor Angles")
+        self.ax_motor_rad.set_title("Joint Model Motor Angles")
         self.ax_motor_rad.set_ylabel("rad")
         self.ax_motor_rad.grid(True, axis="y")
 
