@@ -461,6 +461,11 @@ class InteractivePMACJointTestApp:
 
             self.robot.connect_and_home()
 
+
+            self._log("Synchronizing PMAC target to current position...")
+            safe_pos = self.robot.hold_current_position()
+            self._log(f"Hold current position written: {safe_pos}")
+
             self.connected = True
             self.control_mode = "calibration"
             self.zero_ready = False

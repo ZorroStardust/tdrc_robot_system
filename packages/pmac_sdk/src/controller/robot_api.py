@@ -1,6 +1,7 @@
 from core.config_model import PMACConfig
 from comms.modbus_client import ModbusClient32Bit
 from hardware.ssh_manager import PMACHardwareManager
+import time
 
 class PMACRobotController:
     """具身智能上层控制接口 (严格遵循原机通信逻辑)"""
@@ -9,6 +10,23 @@ class PMACRobotController:
         self.modbus = ModbusClient32Bit(config.ip, config.modbus_port, config.slave_id)
         self.hw_manager = PMACHardwareManager(config.ip, config.ssh_user, config.ssh_pass)
         self.base_positions = [0, 0, 0, 0, 0]
+
+    def hold_current_position(self, move_time: int = 50, accel: int = 50, scurve: int = 0):
+        """
+        将当前位置写成当前目标位置，降低上电后沿用旧目标导致飞车的风险。
+        """
+        current_pos = self.modbus.read_int32_array(address=10, count=5)
+
+        self.modbus.write_int32_array(address=0, values=current_pos)
+        self.modbus.write_int32_array(address=20, values=[move_time, accel, scurve])
+
+        # 先清触发，再触发一次当前位置目标
+        self.modbus.write_int32_array(address=100, values=[0])
+        time.sleep(0.05)
+        self.modbus.write_int32_array(address=100, values=[1])
+
+        self.base_positions = list(current_pos)
+        return current_pos
 
     def hardware_boot(self):
         """执行硬件级别的上电和复位"""
