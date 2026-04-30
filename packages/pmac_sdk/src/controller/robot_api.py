@@ -1,111 +1,212 @@
-from core.config_model import PMACConfig
-from comms.modbus_client import ModbusClient32Bit
-from hardware.ssh_manager import PMACHardwareManager
 import time
+from dataclasses import dataclass
+from typing import List
+
+from comms.modbus_client import PMACModbusClient
+
+
+# =========================
+# Modbus register map
+# int32 address = PMAC Modbus offset / 2
+# =========================
+REG_TARGET_POS = 0       # 0,2,4,6,8
+REG_MOVE_TIME = 20       # PMAC Decode(40)
+REG_ACCEL_TIME = 22      # PMAC Decode(44)
+REG_SCURVE_TIME = 24     # PMAC Decode(48)
+
+REG_ACTUAL_POS = 10      # PMAC Encode(...,20/24/28/32/36)
+
+REG_READY = 30           # P900, Encode(60)
+REG_FAULT = 32           # P901, Encode(64)
+REG_INITIALIZED = 34     # P902, Encode(68)
+REG_ERROR_CODE = 36      # P904, Encode(72)
+REG_ENABLED = 38         # P903, Encode(76)
+REG_LAST_COMMAND = 40    # P905, Encode(80)
+REG_COMMAND_ACK = 42     # P122, Encode(84)
+REG_MOVE_ACK = 44        # P125, Encode(88)
+
+REG_STATUSWORD = 50      # Encode 100,104,108,112,116
+
+REG_COMMAND = 120        # P120, Decode(240)
+REG_COMMAND_SEQ = 122    # P121, Decode(244)
+
+
+CMD_NONE = 0
+CMD_RESET_FAULT = 1
+CMD_SET_CSP = 2
+CMD_ENABLE_OPERATION = 3
+CMD_HOLD_POSITION = 4
+CMD_MOVE = 5
+CMD_STOP = 6
+CMD_DISABLE_OPERATION = 7
+
+
+@dataclass
+class PMACStatus:
+    ready: int
+    fault: int
+    initialized: int
+    enabled: int
+    error_code: int
+    last_command: int
+    command_ack: int
+    move_ack: int
+
+    @property
+    def ok_for_motion(self) -> bool:
+        return (
+            self.ready == 1
+            and self.fault == 0
+            and self.initialized == 1
+            and self.enabled == 1
+        )
+
 
 class PMACRobotController:
-    """具身智能上层控制接口 (严格遵循原机通信逻辑)"""
-    def __init__(self, config: PMACConfig):
-        self.config = config
-        self.modbus = ModbusClient32Bit(config.ip, config.modbus_port, config.slave_id)
-        self.hw_manager = PMACHardwareManager(config.ip, config.ssh_user, config.ssh_pass)
-        self.base_positions = [0, 0, 0, 0, 0]
+    def __init__(self, host: str = "192.168.0.200", port: int = 502, unit_id: int = 1):
+        self.modbus = PMACModbusClient(host=host, port=port, unit_id=unit_id,word_order="low_high")
+        self.command_seq = 0
 
-    def hold_current_position(self, move_time: int = 50, accel: int = 50, scurve: int = 0):
-        """
-        将当前位置写成当前目标位置，降低上电后沿用旧目标导致飞车的风险。
-        """
-        current_pos = self.modbus.read_int32_array(address=10, count=5)
-
-        self.modbus.write_int32_array(address=0, values=current_pos)
-        self.modbus.write_int32_array(address=20, values=[move_time, accel, scurve])
-
-        # 先清触发，再触发一次当前位置目标
-        self.modbus.write_int32_array(address=100, values=[0])
-        time.sleep(0.05)
-        self.modbus.write_int32_array(address=100, values=[1])
-
-        self.base_positions = list(current_pos)
-        return current_pos
-
-    def hardware_boot(self):
-        """执行硬件级别的上电和复位"""
-        self.hw_manager.init_motors()
-
-    # def connect_and_home(self):
-        # """连接 Modbus 并获取当前真实位置作为基准"""
-        # if not self.modbus.connect():
-            # raise ConnectionError("❌ 无法连接到 PMAC，请检查网络设置。")
-        
-        # 按照原代码逻辑，直接去读地址 10 的 10个寄存器
-        # res = self.modbus.client.read_holding_registers(address=10, count=10, slave=self.config.slave_id)
-        # if not res.isError():
-            # regs = res.registers
-            # for i in range(5):
-                # self.base_positions[i] = self.modbus._registers_to_int32(regs[i*2], regs[i*2+1])
-        # print(f"✅ 系统就绪，基准位置: {self.base_positions}")
-
-    def connect_and_home(self):
-        """连接 Modbus 并获取当前真实位置作为基准"""
+    def connect(self) -> None:
         if not self.modbus.connect():
-            raise ConnectionError("❌ 无法连接到 PMAC，请检查网络设置。")
+            raise ConnectionError("Failed to connect PMAC Modbus TCP.")
 
-        self.base_positions = self.modbus.read_int32_array(address=10, count=5)
-        print(f"✅ 系统就绪，基准位置: {self.base_positions}")
+        # 从 PMAC 当前 ack 继续递增，避免重启 Python 后 seq 重复
+        try:
+            self.command_seq = self.modbus.read_int32(REG_COMMAND_ACK)
+        except Exception:
+            self.command_seq = 0
 
+    def close(self) -> None:
+        self.modbus.close()
 
-    def move_joints(self, target_pulses: list, move_time: int = 500, accel: int = 100, scurve: int = 50):
-        """核心底层：只下发原版的地址 0 和 地址 100，并新增动态时间参数"""
-        # 1. 写入 5 个电机的目标坐标 (地址 0)
-        self.modbus.write_int32_array(address=0, values=target_pulses)
-        
-        # 2. 写入动态时间参数 (地址 20，对应 PMAC 字节 40, 44, 48)
-        self.modbus.write_int32_array(address=20, values=[move_time, accel, scurve])
-        
-        # 3. 扣动扳机 (地址 100)
-        self.modbus.write_int32_array(address=100, values=[1])
+    def read_status(self) -> PMACStatus:
+        return PMACStatus(
+            ready=self.modbus.read_int32(REG_READY),
+            fault=self.modbus.read_int32(REG_FAULT),
+            initialized=self.modbus.read_int32(REG_INITIALIZED),
+            error_code=self.modbus.read_int32(REG_ERROR_CODE),
+            enabled=self.modbus.read_int32(REG_ENABLED),
+            last_command=self.modbus.read_int32(REG_LAST_COMMAND),
+            command_ack=self.modbus.read_int32(REG_COMMAND_ACK),
+            move_ack=self.modbus.read_int32(REG_MOVE_ACK),
+        )
 
-    def move_single_joint_angle(self, joint_idx: int, angle: float, move_time: int = 500, accel: int = 100, scurve: int = 50):
-        """按照你的原版逻辑换算角度，增加速度控制"""
-        targets = list(self.base_positions)
-        target_pulses = int(self.base_positions[joint_idx] + (angle * self.config.pulses_per_degree))
-        targets[joint_idx] = target_pulses
-        
-        print(f"🎯 正在向电机 {joint_idx+1} 发送指令: 目标角度 {angle}°, 对应绝对脉冲 {target_pulses}")
-        print(f"⏱️  期望耗时: {move_time}ms, 加减速: {accel}ms，s型时间{scurve}")
-        
-        # 透传参数到底层
-        self.move_joints(targets, move_time=move_time, accel=accel, scurve=scurve)
-        
-    def set_current_as_absolute_zero(self):
-        """
-        【标定模式】：将机器人手动摆到标准的“零点姿态”后调用此方法。
-        把当前的物理脉冲记录下来，作为绝对零点偏置。
-        (实际工程中，这个偏置应该被保存到 default_pmac.yaml 里持久化)
-        """
-        current_pos = self.modbus.read_int32_array(address=10, count=5)
-        self.config.zero_offsets = current_pos
-        # 更新当前的相对基准，防止乱跳
-        self.base_positions = current_pos
-        print(f"✅ 已标定绝对零点偏置: {self.config.zero_offsets}")
+    def read_actual_positions(self) -> List[int]:
+        return self.modbus.read_int32_array(REG_ACTUAL_POS, 5)
 
-    def move_to_absolute_angle(self, joint_idx: int, absolute_angle: float, move_time: int = 500, accel: int = 100, scurve: int = 50):
-        """
-        【绝对控制】：基于标定好的物理零点进行精确到角度的控制。
-        无论在哪上电，指令发 0°，机械臂就一定会回到物理固定的那个 0° 姿态。
-        """
-        # 1. 获取当前所有轴的最新绝对脉冲，防止其他轴被误归零
-        current_pos = self.modbus.read_int32_array(address=10, count=5)
-        targets = list(current_pos)
-        
-        # 2. 计算目标脉冲：零点偏置 + 目标角度对应的脉冲
-        target_pulses = int(self.config.zero_offsets[joint_idx] + (absolute_angle * self.config.pulses_per_degree))
-        targets[joint_idx] = target_pulses
-        
-        print(f"🎯 绝对控制 -> 电机 {joint_idx+1} 目标角度 {absolute_angle}°, 对应脉冲 {target_pulses}")
-        
-        # 3. 发送运动指令
-        self.move_joints(targets, move_time=move_time, accel=accel, scurve=scurve)
-        
-    def close(self):
-        self.modbus.disconnect()
+    def read_statuswords(self) -> List[int]:
+        return self.modbus.read_int32_array(REG_STATUSWORD, 5)
+
+    def send_command(self, command: int, timeout: float = 3.0) -> PMACStatus:
+        self.command_seq += 1
+
+        self.modbus.write_int32(REG_COMMAND, int(command))
+        self.modbus.write_int32(REG_COMMAND_SEQ, int(self.command_seq))
+
+        self._wait_command_ack(self.command_seq, timeout=timeout)
+
+        status = self.read_status()
+        if status.error_code != 0 and command not in (CMD_STOP, CMD_DISABLE_OPERATION):
+            raise RuntimeError(f"PMAC command failed: cmd={command}, status={status}")
+
+        return status
+
+    def _wait_command_ack(self, seq: int, timeout: float = 3.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ack = self.modbus.read_int32(REG_COMMAND_ACK)
+            if ack == seq:
+                return
+            time.sleep(0.02)
+        raise TimeoutError(f"PMAC command ack timeout: seq={seq}")
+
+    def reset_fault(self) -> PMACStatus:
+        return self.send_command(CMD_RESET_FAULT, timeout=3.0)
+
+    def set_csp_mode(self) -> PMACStatus:
+        return self.send_command(CMD_SET_CSP, timeout=2.0)
+
+    def enable_operation(self) -> PMACStatus:
+        return self.send_command(CMD_ENABLE_OPERATION, timeout=3.0)
+
+    def hold_current_position(self) -> PMACStatus:
+        return self.send_command(CMD_HOLD_POSITION, timeout=2.0)
+
+    def stop(self) -> PMACStatus:
+        return self.send_command(CMD_STOP, timeout=2.0)
+
+    def disable_operation(self) -> PMACStatus:
+        return self.send_command(CMD_DISABLE_OPERATION, timeout=2.0)
+
+    def startup_sequence(self) -> PMACStatus:
+        self.reset_fault()
+        time.sleep(0.3)
+
+        self.set_csp_mode()
+        time.sleep(0.2)
+
+        self.enable_operation()
+        time.sleep(0.3)
+
+        self.hold_current_position()
+        time.sleep(0.2)
+
+        status = self.read_status()
+        if not status.ok_for_motion:
+            raise RuntimeError(f"PMAC not ready after startup: {status}")
+
+        return status
+
+    def move_joints(
+        self,
+        target_positions: List[int],
+        move_time: int = 500,
+        accel_time: int = 100,
+        scurve_time: int = 50,
+    ) -> PMACStatus:
+        if len(target_positions) != 5:
+            raise ValueError("target_positions must contain 5 joint positions.")
+
+        status = self.read_status()
+        if not status.ok_for_motion:
+            raise RuntimeError(f"PMAC is not ready for motion: {status}")
+
+        self.modbus.write_int32_array(REG_TARGET_POS, [int(x) for x in target_positions])
+        self.modbus.write_int32(REG_MOVE_TIME, int(move_time))
+        self.modbus.write_int32(REG_ACCEL_TIME, int(accel_time))
+        self.modbus.write_int32(REG_SCURVE_TIME, int(scurve_time))
+
+        # 新架构：只发送 CMD_MOVE，不再写 P123/P124
+        return self.send_command(CMD_MOVE, timeout=3.0)
+
+    def move_relative(
+        self,
+        delta_positions: List[int],
+        move_time: int = 500,
+        accel_time: int = 100,
+        scurve_time: int = 50,
+    ) -> PMACStatus:
+        if len(delta_positions) != 5:
+            raise ValueError("delta_positions must contain 5 joint positions.")
+
+        current = self.read_actual_positions()
+        target = [current[i] + int(delta_positions[i]) for i in range(5)]
+        return self.move_joints(target, move_time, accel_time, scurve_time)
+
+    def print_status(self) -> None:
+        status = self.read_status()
+        positions = self.read_actual_positions()
+        statuswords = self.read_statuswords()
+
+        print("PMAC status:")
+        print(f"  ready       : {status.ready}")
+        print(f"  fault       : {status.fault}")
+        print(f"  initialized : {status.initialized}")
+        print(f"  enabled     : {status.enabled}")
+        print(f"  error_code  : {status.error_code}")
+        print(f"  last_command: {status.last_command}")
+        print(f"  command_ack : {status.command_ack}")
+        print(f"  move_ack    : {status.move_ack}")
+        print(f"  positions   : {positions}")
+        print(f"  statuswords : {statuswords}")

@@ -1,65 +1,151 @@
+import time
+import struct
 import inspect
-from pymodbus.client import ModbusTcpClient
-from typing import List
+from typing import List, Optional
+
+try:
+    from pymodbus.client import ModbusTcpClient
+except ImportError:
+    from pymodbus.client.sync import ModbusTcpClient
 
 
-class ModbusClient32Bit:
-    def __init__(self, ip: str, port: int, slave_id: int):
-        self.client = ModbusTcpClient(host=ip, port=port)
-        self.slave_id = slave_id
+def _id_kw(func, device_id):
+    params = inspect.signature(func).parameters
+
+    if "slave" in params:
+        return {"slave": device_id}
+    if "unit" in params:
+        return {"unit": device_id}
+    if "device_id" in params:
+        return {"device_id": device_id}
+
+    return {}
+
+
+def write_regs(client, address, values, device_id=1):
+    return client.write_registers(
+        address,
+        values=values,
+        **_id_kw(client.write_registers, device_id),
+    )
+
+
+def read_regs(client, address, count, device_id=1):
+    return client.read_holding_registers(
+        address,
+        count=count,
+        **_id_kw(client.read_holding_registers, device_id),
+    )
+
+
+
+class PMACModbusClient:
+    def __init__(self, 
+                 host: str = "192.168.0.200", 
+                 port: int = 502, 
+                 unit_id: int = 1, 
+                 timeout: float = 1.0,
+                 word_order: str = "low_high"):
+        self.host = host
+        self.port = port
+        self.unit_id = unit_id
+        self.timeout = timeout
+        self.word_order = word_order
+        self.client: Optional[ModbusTcpClient] = None
 
     def connect(self) -> bool:
-        return self.client.connect()
+        self.client = ModbusTcpClient(host=self.host, port=self.port, timeout=self.timeout)
+        return bool(self.client.connect())
 
-    def disconnect(self):
-        self.client.close()
+    def close(self) -> None:
+        if self.client:
+            self.client.close()
 
-    @staticmethod
-    def _int32_to_registers(val: int) -> List[int]:
-        val = int(val) & 0xFFFFFFFF
-        return [val & 0xFFFF, (val >> 16) & 0xFFFF]
+    def _require_connected(self) -> None:
+        if self.client is None:
+            raise RuntimeError("Modbus client is not connected.")
 
-    @staticmethod
-    def _registers_to_int32(low: int, high: int) -> int:
-        val = low + (high << 16)
-        return val - 0x100000000 if val >= 0x80000000 else val
+    # @staticmethod
+    # def int32_to_regs(value: int) -> List[int]:
+    #     value = int(value)
+    #     packed = struct.pack(">i", value)
+    #     hi, lo = struct.unpack(">HH", packed)
+    #     return [hi, lo]
 
-    def _slave_kw(self):
-        sig = inspect.signature(self.client.read_holding_registers)
-        params = sig.parameters
+    def int32_to_regs(self, value: int) -> List[int]:
+        value = int(value) & 0xFFFFFFFF
+        hi = (value >> 16) & 0xFFFF
+        lo = value & 0xFFFF
 
-        if "device_id" in params:
-            return {"device_id": self.slave_id}
-        if "slave" in params:
-            return {"slave": self.slave_id}
-        if "unit" in params:
-            return {"unit": self.slave_id}
+        if self.word_order == "low_high":
+            return [lo, hi]
+        else:
+            return [hi, lo]
 
-        return {}
 
-    def write_int32_array(self, address: int, values: List[int]) -> bool:
-        regs = []
-        for v in values:
-            regs.extend(self._int32_to_registers(v))
+    # @staticmethod
+    # def regs_to_int32(regs: List[int]) -> int:
+    #     packed = struct.pack(">HH", regs[0] & 0xFFFF, regs[1] & 0xFFFF)
+    #     return struct.unpack(">i", packed)[0]
 
-        res = self.client.write_registers(
-            address=address,
-            values=regs,
-            **self._slave_kw(),
-        )
-        return not res.isError()
+    def regs_to_int32(self, regs: List[int]) -> int:
+        if len(regs) < 2:
+            raise ValueError("regs must contain at least 2 registers.")
+
+        if self.word_order == "low_high":
+            lo = regs[0] & 0xFFFF
+            hi = regs[1] & 0xFFFF
+        else:
+            hi = regs[0] & 0xFFFF
+            lo = regs[1] & 0xFFFF
+
+        value = (hi << 16) | lo
+
+        if value & 0x80000000:
+            value -= 0x100000000
+
+        return value
+
+
+    def write_int32(self, address: int, value: int) -> None:
+        self._require_connected()
+        regs = self.int32_to_regs(value)
+        result = write_regs(self.client, address=address, values=regs, device_id=self.unit_id)
+        if result.isError():
+            raise RuntimeError(f"write_int32 failed: address={address}, value={value}, result={result}")
+
+    def write_int32_array(self, address: int, values: List[int]) -> None:
+        self._require_connected()
+        regs: List[int] = []
+        for value in values:
+            regs.extend(self.int32_to_regs(value))
+        result = write_regs(self.client, address=address, values=regs, device_id=self.unit_id)
+        if result.isError():
+            raise RuntimeError(f"write_int32_array failed: address={address}, values={values}, result={result}")
+
+    def read_int32(self, address: int) -> int:
+        self._require_connected()
+        result = read_regs(self.client, address=address, count=2, device_id=self.unit_id)
+        if result.isError():
+            raise RuntimeError(f"read_int32 failed: address={address}, result={result}")
+        return self.regs_to_int32(result.registers)
 
     def read_int32_array(self, address: int, count: int) -> List[int]:
-        res = self.client.read_holding_registers(
-            address=address,
-            count=count * 2,
-            **self._slave_kw(),
-        )
+        self._require_connected()
+        result = read_regs(self.client, address=address, count=count * 2, device_id=self.unit_id)
+        if result.isError():
+            raise RuntimeError(f"read_int32_array failed: address={address}, count={count}, result={result}")
+        regs = result.registers
+        return [self.regs_to_int32(regs[i * 2:i * 2 + 2]) for i in range(count)]
 
-        if res.isError():
-            raise ConnectionError(f"Modbus Read Error at address {address}")
+    # def pulse_int32(self, address: int, value: int = 1, delay: float = 0.02) -> None:
+    #     self.write_int32(address, 0)
+    #     time.sleep(delay)
+    #     self.write_int32(address, value)
 
-        return [
-            self._registers_to_int32(res.registers[i * 2], res.registers[i * 2 + 1])
-            for i in range(count)
-        ]
+    def pulse_int32(self, address: int, value: int = 1, delay: float = 0.02) -> None:
+        self.write_int32(address, 0)
+        time.sleep(delay)
+        self.write_int32(address, value)
+        time.sleep(delay)
+        self.write_int32(address, 0)

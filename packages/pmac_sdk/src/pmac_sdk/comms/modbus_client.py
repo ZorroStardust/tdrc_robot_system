@@ -1,3 +1,5 @@
-from comms.modbus_client import ModbusClient32Bit
+from comms.modbus_client import PMACModbusClient
 
-__all__ = ["ModbusClient32Bit"]
+ModbusClient32Bit = PMACModbusClient
+
+__all__ = ["PMACModbusClient", "ModbusClient32Bit"]
